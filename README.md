@@ -42,42 +42,34 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profil
 source "$HOME/.cargo/env"
 ```
 
-### Step 2.2 — Build triagent
-
-From the folder that contains this README:
+### Step 2.2 — Install with one command
 
 ```bash
-cargo build --release
+./install.sh
 ```
 
-This takes 1–2 minutes and downloads the dependencies once.
+That single command builds the release binary, installs it to
+`~/.local/bin/triagent`, and copies the **89 bundled skills** into
+`~/.config/triagent/skills/`.
 
-### Step 2.3 — Put it on your PATH
-
-```bash
-install -m755 target/release/triagent ~/.local/bin/triagent
-```
-
-Make sure `~/.local/bin` is in your PATH (it usually is). Check:
+Verify:
 
 ```bash
 triagent --version
 ```
 
-### Step 2.4 — Install the skills (recommended)
-
-The repo bundles 89 skills. Install them with one command:
+<details>
+<summary>Manual install (if you prefer)</summary>
 
 ```bash
+cargo build --release
+install -m755 target/release/triagent ~/.local/bin/triagent
 ./scripts/install-skills.sh
 ```
 
-That copies them to `~/.config/triagent/skills/`, where triagent finds them
-automatically.
-
-If you see a version number and the skills line, you're done. 🎉
-
-> Shortcut: `cargo install --path .` also installs it to `~/.cargo/bin`.
+Running the binary straight from `target/release/` also works — it finds the
+repo's `skills/` folder automatically.
+</details>
 
 ---
 

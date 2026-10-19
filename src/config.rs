@@ -34,7 +34,9 @@ pub struct SkillsCfg {
 }
 
 impl SkillsCfg {
-    /// Expanded skill roots; defaults to ~/.config/triagent/skills.
+    /// Expanded skill roots. Always includes ~/.config/triagent/skills and,
+    /// for repo checkouts / `cargo build` runs, any `skills/` folder next to
+    /// the binary — so skills work without running the install script.
     pub fn expanded(&self) -> Vec<std::path::PathBuf> {
         let mut v: Vec<std::path::PathBuf> = self
             .dirs
@@ -49,9 +51,19 @@ impl SkillsCfg {
                 }
             })
             .collect();
-        if v.is_empty() {
-            v.push(config_dir().join("skills"));
+        v.push(config_dir().join("skills"));
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                for rel in ["skills", "../skills", "../../skills"] {
+                    let p = dir.join(rel);
+                    if p.is_dir() {
+                        v.push(p);
+                    }
+                }
+            }
         }
+        v.sort();
+        v.dedup();
         v
     }
 }
