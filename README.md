@@ -156,7 +156,8 @@ Open with `/` for the list, or type them directly:
 | Command | What it does |
 |---|---|
 | `/help` | show all commands |
-| `/model <id>` · `/models` | switch / list models |
+| `/model` · `/models` | pick a model from a list |
+| `/model <id>` | switch directly to a model id |
 | `/provider <id>` | switch provider |
 | `/theme <name>` · `/themes` | change colors |
 | `/status` · `/cost` | quota and token/cost totals |

@@ -35,6 +35,7 @@ pub trait Ui: Send + Sync {
     fn set_busy(&self, busy: bool);
     fn set_status(&self, left: String, right: String);
     fn set_theme(&self, name: String);
+    fn show_picker(&self, title: &str, command_prefix: &str, items: Vec<(String, String)>);
     fn clear(&self);
 }
 
@@ -128,6 +129,31 @@ pub struct MenuState {
     pub selected: usize,
 }
 
+/// A dynamic picker (model list, etc.) shown above the input box.
+#[derive(Clone, Debug)]
+pub struct Picker {
+    pub title: String,
+    /// Prefix used to submit the choice, e.g. "/model ".
+    pub command_prefix: String,
+    pub items: Vec<(String, String)>,
+    pub filter: String,
+    pub selected: usize,
+}
+
+impl Picker {
+    fn visible(&self) -> Vec<&(String, String)> {
+        let f = self.filter.to_ascii_lowercase();
+        self.items
+            .iter()
+            .filter(|(id, desc)| {
+                f.is_empty()
+                    || id.to_ascii_lowercase().contains(&f)
+                    || desc.to_ascii_lowercase().contains(&f)
+            })
+            .collect()
+    }
+}
+
 impl MenuState {
     fn matches(&self) -> Vec<usize> {
         COMMANDS
@@ -155,6 +181,7 @@ pub struct AppState {
     pub question: Option<PendingQuestion>,
     pub scroll_offset: usize,
     pub menu: Option<MenuState>,
+    pub picker: Option<Picker>,
     pub theme_name: String,
     pub exit: bool,
     pub dirty: bool,
@@ -175,6 +202,7 @@ impl Default for AppState {
             question: None,
             scroll_offset: 0,
             menu: None,
+            picker: None,
             theme_name: "claude".into(),
             exit: false,
             dirty: true,
@@ -272,7 +300,18 @@ impl Tui {
                         continue;
                     }
 
-                    // 2. Slash-command menu open?
+                    // 2. Picker open (models etc.)?
+                    if st.picker.is_some() {
+                        let submit = handle_picker_key(&mut st, &ev);
+                        st.dirty = true;
+                        if let Some(line) = submit {
+                            drop(st);
+                            let _ = submit_tx.send(line);
+                        }
+                        continue;
+                    }
+
+                    // 3. Slash-command menu open?
                     if st.menu.is_some() {
                         let submit = handle_menu_key(&mut st, &ev);
                         st.dirty = true;
@@ -283,7 +322,7 @@ impl Tui {
                         continue;
                     }
 
-                    // 3. Normal editing / keys.
+                    // 4. Normal editing / keys.
                     match &ev {
                         Event::Paste(text) => insert_text(&mut st, text),
                         Event::Key(k) if k.kind != KeyEventKind::Release => {
@@ -528,6 +567,18 @@ impl Tui {
         self.with(|st| st.busy = busy);
     }
 
+    pub fn show_picker(&self, title: &str, command_prefix: &str, items: Vec<(String, String)>) {
+        self.with(|st| {
+            st.picker = Some(Picker {
+                title: title.to_string(),
+                command_prefix: command_prefix.to_string(),
+                items,
+                filter: String::new(),
+                selected: 0,
+            });
+        });
+    }
+
     pub fn set_theme(&self, name: String) {
         self.with(|st| st.theme_name = name);
     }
@@ -597,6 +648,9 @@ impl Ui for TuiUi {
     }
     fn set_theme(&self, name: String) {
         self.tui.set_theme(name);
+    }
+    fn show_picker(&self, title: &str, command_prefix: &str, items: Vec<(String, String)>) {
+        self.tui.show_picker(title, command_prefix, items);
     }
     fn clear(&self) {
         self.tui.clear_transcript();
@@ -700,6 +754,50 @@ fn handle_menu_key(st: &mut AppState, ev: &Event) -> Option<String> {
     }
 }
 
+fn handle_picker_key(st: &mut AppState, ev: &Event) -> Option<String> {
+    let Event::Key(k) = ev else { return None };
+    if k.kind == KeyEventKind::Release {
+        return None;
+    }
+    let picker = st.picker.as_mut().expect("picker open");
+    match (k.modifiers, k.code) {
+        (_, KeyCode::Esc) => {
+            st.picker = None;
+            None
+        }
+        (_, KeyCode::Up) => {
+            picker.selected = picker.selected.saturating_sub(1);
+            None
+        }
+        (_, KeyCode::Down) => {
+            let len = picker.visible().len();
+            if len > 0 {
+                picker.selected = (picker.selected + 1).min(len - 1);
+            }
+            None
+        }
+        (_, KeyCode::Enter) => {
+            let visible: Vec<(String, String)> = picker.visible().into_iter().cloned().collect();
+            let idx = picker.selected.min(visible.len().saturating_sub(1));
+            let picked = visible.get(idx).cloned();
+            let prefix = picker.command_prefix.clone();
+            st.picker = None;
+            picked.map(|(id, _)| format!("{prefix}{id}"))
+        }
+        (_, KeyCode::Backspace) => {
+            picker.filter.pop();
+            picker.selected = 0;
+            None
+        }
+        (_, KeyCode::Char(c)) => {
+            picker.filter.push(c);
+            picker.selected = 0;
+            None
+        }
+        _ => None,
+    }
+}
+
 fn insert_text(st: &mut AppState, text: &str) {
     let before: String = st.input.chars().take(st.cursor).collect();
     let after: String = st.input.chars().skip(st.cursor).collect();
@@ -745,13 +843,16 @@ fn render_to_ansi(st: &AppState, width: u16, height: u16) -> String {
     out.push_str(&reset);
     out.push_str(CRLF);
 
-    // ---- Layout budget ------------------------------------------------------
-    let menu_items: Vec<usize> = match &st.menu {
-        Some(m) => m.matches(),
-        None => Vec::new(),
+    // ---- Layout budget (picker or command menu) -----------------------------
+    let list_len = if let Some(p) = &st.picker {
+        p.visible().len()
+    } else if let Some(m) = &st.menu {
+        m.matches().len()
+    } else {
+        0
     };
-    let menu_h = if st.menu.is_some() {
-        menu_items.len().min(10) + 2
+    let menu_h = if st.picker.is_some() || st.menu.is_some() {
+        list_len.min(10) + 2
     } else {
         0
     };
@@ -791,51 +892,34 @@ fn render_to_ansi(st: &AppState, width: u16, height: u16) -> String {
     out.push_str(&reset);
     out.push_str(CRLF);
 
-    // ---- Slash-command menu -------------------------------------------------
-    if let Some(menu) = &st.menu {
-        out.push_str(&dim);
-        out.push_str("╭─ slash commands (↑/↓ · Enter · Esc)");
-        let fill = w.saturating_sub("╭─ slash commands (↑/↓ · Enter · Esc)".chars().count() + 1);
-        for _ in 0..fill {
-            out.push('─');
+    // ---- Picker / slash-command menu ----------------------------------------
+    if let Some(picker) = &st.picker {
+        let visible: Vec<(String, String)> = picker.visible().into_iter().cloned().collect();
+        let title = format!("{} (↑/↓ · Enter · Esc)", picker.title);
+        render_list(
+            &mut out,
+            &title,
+            &visible,
+            picker.selected,
+            &picker.filter,
+            w,
+            th,
+        );
+    } else if let Some(menu) = &st.menu {
+        let items: Vec<(String, String)> = menu
+            .matches()
+            .iter()
+            .map(|&i| {
+                let (n, d, _) = COMMANDS[i];
+                (n.to_string(), d.to_string())
+            })
+            .collect();
+        let mut title = String::from("slash commands (↑/↓ · Enter · Esc)");
+        if !menu.filter.is_empty() {
+            title.push_str(" · ");
+            title.push_str(&menu.filter);
         }
-        out.push('╮');
-        out.push_str(&reset);
-        out.push_str(CRLF);
-        let visible = menu_items;
-        let start_idx = menu
-            .selected
-            .saturating_sub(8)
-            .min(visible.len().saturating_sub(10));
-        let slice = &visible[start_idx..(start_idx + 10).min(visible.len())];
-        let (selbg, selfg) = th.selection();
-        for &i in slice {
-            let (name, desc, _) = COMMANDS[i];
-            let selected = i == visible.get(menu.selected).copied().unwrap_or(usize::MAX);
-            let mut line = format!(" {name:<14} {desc}");
-            line = truncate_chars(&line, w.saturating_sub(2));
-            let pad = w.saturating_sub(line.chars().count());
-            for _ in 0..pad {
-                line.push(' ');
-            }
-            if selected {
-                out.push_str(&selbg);
-                out.push_str(&selfg);
-                out.push_str(&line);
-                out.push_str(&reset);
-            } else {
-                out.push_str(&line);
-            }
-            out.push_str(CRLF);
-        }
-        out.push_str(&dim);
-        out.push('╰');
-        for _ in 0..w.saturating_sub(2) {
-            out.push('─');
-        }
-        out.push('╯');
-        out.push_str(&reset);
-        out.push_str(CRLF);
+        render_list(&mut out, &title, &items, menu.selected, &menu.filter, w, th);
     }
 
     // ---- Input box ----------------------------------------------------------
@@ -897,6 +981,68 @@ fn render_to_ansi(st: &AppState, width: u16, height: u16) -> String {
     out.push_str(&reset);
 
     out
+}
+
+fn render_list(
+    out: &mut String,
+    title: &str,
+    items: &[(String, String)],
+    selected: usize,
+    _filter: &str,
+    w: usize,
+    th: &Theme,
+) {
+    let dim = th.dim();
+    let reset = th.reset();
+    out.push_str(&dim);
+    out.push('╭');
+    out.push('─');
+    out.push(' ');
+    out.push_str(title);
+    out.push(' ');
+    let head = format!("╭─ {title} ").chars().count();
+    let fill = w.saturating_sub(head + 1);
+    for _ in 0..fill {
+        out.push('─');
+    }
+    out.push('╮');
+    out.push_str(&reset);
+    out.push_str(CRLF);
+
+    let start_idx = selected
+        .saturating_sub(8)
+        .min(items.len().saturating_sub(10));
+    let end = (start_idx + 10).min(items.len());
+    let (selbg, selfg) = th.selection();
+    for (i, (id, desc)) in items
+        .iter()
+        .enumerate()
+        .skip(start_idx)
+        .take(end - start_idx)
+    {
+        let mut line = format!(" {id:<22} {desc}");
+        line = truncate_chars(&line, w.saturating_sub(2));
+        while line.chars().count() < w.saturating_sub(1) {
+            line.push(' ');
+        }
+        if i == selected {
+            out.push_str(&selbg);
+            out.push_str(&selfg);
+            out.push_str(&line);
+            out.push_str(&reset);
+        } else {
+            out.push_str(&line);
+        }
+        out.push_str(CRLF);
+    }
+    out.push_str(&dim);
+    out.push('╰');
+    for _ in 0..w.saturating_sub(2) {
+        out.push('─');
+    }
+    out.push('╯');
+    out.push_str(&reset);
+    out.push_str(CRLF);
 }
 
 fn paint_line(kind: LineKind, text: &str, w: usize, th: &Theme) -> String {

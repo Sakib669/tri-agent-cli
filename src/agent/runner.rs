@@ -686,6 +686,25 @@ impl Core {
         self.update_status();
     }
 
+    async fn show_model_picker(&mut self) {
+        match self.provider.list_models().await {
+            Ok(models) if !models.is_empty() => {
+                let items: Vec<(String, String)> = models
+                    .iter()
+                    .map(|m| (m.id.clone(), m.quota.clone().unwrap_or_default()))
+                    .collect();
+                let has_tui = self.tui.is_some();
+                self.ui.show_picker("models", "/model ", items);
+                if has_tui {
+                    self.ui.info("pick a model (↑/↓, Enter, Esc)");
+                } else {
+                    self.ui.info("switch with /model <id>");
+                }
+            }
+            _ => self.ui.info("could not list models for this provider"),
+        }
+    }
+
     async fn compact(&mut self) {
         self.ui.info("compacting conversation…");
         let mut msgs = self.messages.clone();
@@ -809,6 +828,11 @@ impl Ui for PlainUi {
         tui::dim(&format!("{left} · {right}"));
     }
     fn set_theme(&self, _name: String) {}
+    fn show_picker(&self, _title: &str, _prefix: &str, items: Vec<(String, String)>) {
+        for (id, desc) in items {
+            println!("  {:<26} {}", id, desc);
+        }
+    }
     fn clear(&self) {}
 }
 
@@ -1124,7 +1148,7 @@ async fn handle_command(core: &mut Core, line: &str) -> Result<bool> {
             Ok(true)
         }
         "/model" => {
-            core.ui.info(&format!("current model: {}", core.model));
+            core.show_model_picker().await;
             Ok(true)
         }
         "/doctor" => {
@@ -1157,7 +1181,7 @@ async fn handle_command(core: &mut Core, line: &str) -> Result<bool> {
         cmd if cmd.starts_with("/model ") => {
             let m = cmd.trim_start_matches("/model ").trim().to_string();
             if m.is_empty() {
-                core.ui.info("usage: /model <model-id>");
+                core.show_model_picker().await;
             } else {
                 core.model = m;
                 core.update_status();
@@ -1312,22 +1336,10 @@ async fn handle_command(core: &mut Core, line: &str) -> Result<bool> {
             core.new_session();
             Ok(true)
         }
-        "/models" => match core.provider.list_models().await {
-            Ok(models) => {
-                for m in models.iter().take(40) {
-                    core.ui.info(&format!(
-                        "{:<28} {}",
-                        m.id,
-                        m.quota.as_deref().unwrap_or("")
-                    ));
-                }
-                Ok(true)
-            }
-            Err(e) => {
-                core.ui.info(&format!("could not list models: {e}"));
-                Ok(true)
-            }
-        },
+        "/models" => {
+            core.show_model_picker().await;
+            Ok(true)
+        }
         "/details" => {
             core.details = !core.details;
             core.ui.info(&format!(
