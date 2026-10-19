@@ -1,0 +1,48 @@
+[package]
+name = "triagent"
+version = "0.2.0"
+edition = "2021"
+description = "CLI agent for Claude / ChatGPT / Gemini subscriptions via browser OAuth (Linux)"
+license = "MIT"
+
+[[bin]]
+name = "triagent"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process", "time", "io-util", "net", "fs", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json", "gzip", "http2", "charset"] }
+eventsource-stream = "0.2"
+futures-core = "0.3"
+futures-util = "0.3"
+bytes = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+toml = "0.8"
+anyhow = "1"
+thiserror = "2"
+dirs = "6"
+open = "5"
+async-trait = "0.1"
+async-stream = "0.3"
+crossterm = { version = "0.28", features = ["bracketed-paste"] }
+unicode-width = "0.2"
+regex = "1"
+globset = "0.4"
+sha2 = "0.10"
+base64 = "0.22"
+rand = "0.8"
+time = { version = "0.3", features = ["formatting", "parsing", "macros", "serde"] }
+url = "2"
+uuid = { version = "1", features = ["v4"] }
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time", "process", "signal"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
