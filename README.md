@@ -157,13 +157,16 @@ Open with `/` for the list, or type them directly:
 |---|---|
 | `/help` | show all commands |
 | `/model` · `/models` | pick a model from a list |
+
+Need more room in a long session? triagent trims the transcript automatically and
+`/compact` always succeeds — see [docs/REFERENCE.md](docs/REFERENCE.md#context-handling).
 | `/model <id>` | switch directly to a model id |
 | `/provider <id>` | switch provider |
 | `/theme <name>` · `/themes` | change colors |
 | `/status` · `/cost` | quota and token/cost totals |
 | `/permissions` | show the current permission mode |
 | `/skills` · `/skill <name>` | list and load skills |
-| `/compact` | summarize the conversation to free context |
+| `/compact` | summarize the conversation to free context (works even when the window is already full) |
 | `/undo` · `/rewind` | undo the last turn |
 | `/new` | start a fresh session |
 | `/sessions` · `/resume <id>` | list / load saved sessions |

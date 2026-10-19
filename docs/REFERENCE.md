@@ -45,6 +45,30 @@ Answers to a prompt: `y` yes · `n` no · `a` allow everything this session.
 | `/clear` | reset the conversation |
 | `/new` | start a fresh session |
 | `/compact` `/summarize` | summarize the conversation to free context |
+
+### Context handling
+
+triagent keeps a long session alive on its own:
+
+- **Automatic trimming.** Before every request the transcript is measured
+  (≈4 chars per token) against the model's window — 1M for Gemini, 400k for
+  GPT-5/Codex, 200k for Claude. If it does not fit, the oldest messages are
+  dropped and a marker is left behind, and huge tool outputs (a big file read,
+  a long build log) are shortened in place. You see `context window nearly full
+  — dropped N older messages` when it happens.
+- **Overflow recovery.** If a provider still rejects the request as too large,
+  triagent trims harder and retries the same turn instead of failing.
+- **Compaction that cannot fail.** `/compact` summarizes in chunks of at most
+  ~60k characters, so each summarization request is small enough to fit even
+  when the conversation is already past the limit. It shows `summarizing part
+  i/n…` as it goes, keeps the last exchange verbatim, and rewrites the session
+  file so resuming does not reload the old oversized transcript.
+
+Override the window for a model the built-in table does not know:
+
+```bash
+TRIAGENT_CONTEXT_TOKENS=500000 triagent --provider gemini
+```
 | `/undo` `/rewind` | undo the last turn |
 | `/redo` | redo (kept for parity; currently informational) |
 | `/editor` | compose a message in `$EDITOR` |

@@ -260,10 +260,13 @@ impl Core {
             self.ui.info("not logged in — run /login <provider> first");
             return Ok(());
         }
+        let mut ctx_retries = 0usize;
         for _ in 0..MAX_TURNS {
             if let Some(rx) = cancel_rx {
                 while rx.try_recv().is_ok() {} // drop stale cancel tokens
             }
+            // Never let a turn die on a context-limit error.
+            self.fit_context();
             let req = TurnRequest {
                 system: self.system.clone(),
                 messages: self.messages.clone(),
@@ -331,6 +334,7 @@ impl Core {
                     }
                 }
             }
+            drop(stream);
             self.ui.set_busy(false);
             self.cost
                 .add(self.provider_id, &self.model, in_tok, out_tok);
@@ -341,6 +345,17 @@ impl Core {
                 return Ok(());
             }
             if let Some(e) = err {
+                // Provider said the request is too big: trim hard and retry once
+                // or twice instead of failing the whole turn.
+                if is_context_overflow(&e) && ctx_retries < 2 {
+                    ctx_retries += 1;
+                    let target = self.char_budget() / 2;
+                    let dropped = self.evict_oldest(target);
+                    self.ui.info(&format!(
+                        "context limit hit — dropped {dropped} older messages and retrying"
+                    ));
+                    continue;
+                }
                 self.ui.tool_result(&e, true);
                 return Ok(());
             }
@@ -705,24 +720,93 @@ impl Core {
         }
     }
 
-    async fn compact(&mut self) {
-        self.ui.info("compacting conversation…");
-        let mut msgs = self.messages.clone();
-        msgs.push(Message {
-            role: Role::User,
-            parts: vec![ContentPart::Text {
-                text: "Provide a concise summary of this conversation for continuation: \
-                       what the user asked, what was done, files changed, decisions made, \
-                       and any open items."
-                    .into(),
-            }],
-        });
+    /// Character budget for the conversation: 85% of the model window,
+    /// leaving room for tools and the reply.
+    fn char_budget(&self) -> usize {
+        context_window(&self.model) * 4 * 85 / 100
+    }
+
+    /// Drop the oldest messages until the transcript fits `target` chars.
+    /// Keeps the newest messages so work in progress is never lost.
+    fn evict_oldest(&mut self, target: usize) -> usize {
+        let mut dropped = 0;
+        while chars_of(&self.messages) > target && self.messages.len() > 4 {
+            self.messages.remove(0);
+            dropped += 1;
+        }
+        // Still too big with only a few messages: the overflow is one huge tool
+        // output (a big file read, a long build log). Shrink it in place.
+        let mut shrunk = 0;
+        while chars_of(&self.messages) > target && shrunk < 8 {
+            let Some((mi, largest, _)) = self
+                .messages
+                .iter()
+                .enumerate()
+                .flat_map(|(mi, m)| m.parts.iter().enumerate().map(move |(pi, p)| (mi, pi, p)))
+                .filter_map(|(mi, pi, p)| match p {
+                    ContentPart::ToolResult { content, .. } if content.chars().count() > 2_000 => {
+                        Some((mi, pi, content.chars().count()))
+                    }
+                    _ => None,
+                })
+                .max_by_key(|(_, _, len)| *len)
+            else {
+                break;
+            };
+            if let Some(ContentPart::ToolResult { content, .. }) =
+                self.messages[mi].parts.get_mut(largest)
+            {
+                *content = shorten(content, 4_000).to_string();
+            }
+            shrunk += 1;
+        }
+        if dropped > 0 {
+            self.messages.insert(
+                0,
+                Message {
+                    role: Role::User,
+                    parts: vec![ContentPart::Text {
+                        text: format!(
+                            "[{dropped} earlier messages were removed to fit the model's                              context window; continue from the most recent message.]"
+                        ),
+                    }],
+                },
+            );
+        }
+        dropped
+    }
+
+    /// Trim silently before a provider call so the request always fits.
+    fn fit_context(&mut self) {
+        let budget = self.char_budget();
+        let total = chars_of(&self.messages) + self.system.chars().count() + 24_000;
+        if total <= budget {
+            return;
+        }
+        let target = (budget * 3 / 4).saturating_sub(self.system.chars().count());
+        let dropped = self.evict_oldest(target);
+        if dropped > 0 {
+            self.ui.info(&format!(
+                "context window nearly full — dropped {dropped} older messages"
+            ));
+        }
+    }
+
+    /// One small summarization request (never the whole transcript).
+    async fn summarize(&self, prompt: &str) -> Result<String> {
         let req = TurnRequest {
-            system: "You summarize coding sessions for continuation.".into(),
-            messages: msgs,
+            system: "You summarize coding sessions so work can continue in a fresh window. \
+                     Reply with the summary only."
+                .into(),
+            messages: vec![Message {
+                role: Role::User,
+                parts: vec![ContentPart::Text {
+                    text: prompt.to_string(),
+                }],
+            }],
             tools: vec![],
             model: self.model.clone(),
-            max_tokens: 2000,
+            max_tokens: 1500,
         };
         let mut stream = self.provider.stream_turn(req);
         let mut text = String::new();
@@ -730,41 +814,114 @@ impl Core {
             match item {
                 Ok(ProviderEvent::TextDelta(t)) => text.push_str(&t),
                 Ok(_) => {}
-                Err(e) => {
-                    self.ui.tool_result(&format!("compact failed: {e}"), true);
-                    return;
-                }
+                Err(e) => bail!("{e}"),
             }
         }
-        let summary = text.trim().to_string();
-        self.messages = vec![Message {
-            role: Role::User,
-            parts: vec![ContentPart::Text {
-                text: format!("[Conversation compacted]\n{summary}"),
-            }],
-        }];
-        self.ui.info("conversation compacted");
+        Ok(text)
     }
 
+    /// Compact by summarizing in chunks. Every request stays small, so this
+    /// still works when the conversation is already over the limit.
+    async fn compact(&mut self) {
+        if self.messages.is_empty() {
+            self.ui.info("nothing to compact");
+            return;
+        }
+        let before = chars_of(&self.messages);
+        self.ui.info("compacting conversation…");
+
+        // Sum of the original user turns, so intent survives even if summarization fails.
+        // Big enough to be efficient, small enough that each summarization
+        // request fits comfortably in the window.
+        let chunk_budget = (self.char_budget() / 12).clamp(12_000, 60_000);
+        let chunks = chunk_messages(&self.messages, chunk_budget);
+        let mut summary = String::new();
+        let mut summarized = 0usize;
+
+        let total_chunks = chunks.len();
+        for (i, chunk) in chunks.iter().enumerate() {
+            if total_chunks > 1 {
+                self.ui
+                    .info(&format!("summarizing part {}/{}…", i + 1, total_chunks));
+            }
+            let prompt = if summary.is_empty() {
+                format!(
+                    "Summarize this part of a coding session concisely for continuation: what \
+                     the user asked, what was done, which files changed, decisions made, and \
+                     anything still open.\n\n{chunk}"
+                )
+            } else {
+                format!(
+                    "Running summary so far:\n{summary}\n\nMerge the next part into it. \
+                     Reply with the updated summary only.\n\n{chunk}"
+                )
+            };
+            match self.summarize(&prompt).await {
+                Ok(s) if !s.trim().is_empty() => {
+                    summary = s.trim().to_string();
+                    summarized += 1;
+                }
+                Ok(_) => {}
+                Err(e) => self.ui.info(&format!("skipping one chunk: {e}")),
+            }
+        }
+
+        // Keep the last exchange verbatim for immediate continuity.
+        let tail: Vec<Message> = self.messages.iter().rev().take(2).rev().cloned().collect();
+
+        let note = if summary.is_empty() {
+            self.ui
+                .info("summarizer unavailable — keeping the recent messages verbatim");
+            String::from(
+                "[Conversation compacted. The earlier transcript exceeded the context window \
+                 and was dropped; continue from the messages that follow.]",
+            )
+        } else {
+            format!(
+                "[Conversation compacted from {before} chars ({} chunk(s) summarized)]\n{summary}",
+                summarized
+            )
+        };
+
+        let mut msgs = vec![Message {
+            role: Role::User,
+            parts: vec![ContentPart::Text { text: note }],
+        }];
+        msgs.extend(tail);
+        self.messages = msgs;
+        self.save_session();
+        self.ui.info(&format!(
+            "conversation compacted: {} chars → {} chars",
+            before,
+            chars_of(&self.messages)
+        ));
+    }
+
+    /// Rewrite the session file from the in-memory transcript. Always a full
+    /// rewrite: after a compaction or context trim the file must not keep
+    /// messages the conversation no longer has, or resuming re-breaks it.
     fn save_session(&self) {
         let Some(path) = &self.session_file else {
             return;
         };
-        let Some(last) = self.messages.last() else {
-            return;
-        };
-        let Ok(json) = serde_json::to_string(last) else {
-            return;
-        };
+        let mut body = String::new();
+        for m in &self.messages {
+            let Ok(json) = serde_json::to_string(m) else {
+                continue;
+            };
+            body.push_str(&json);
+            body.push('\n');
+        }
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         if let Ok(mut f) = std::fs::OpenOptions::new()
             .create(true)
-            .append(true)
+            .write(true)
+            .truncate(true)
             .mode(0o600)
             .open(path)
         {
-            let _ = writeln!(f, "{json}");
+            let _ = f.write_all(body.as_bytes());
         }
     }
 }
@@ -1645,20 +1802,160 @@ fn load_memory(cwd: &Path) -> String {
     shorten(&mem, 4000)
 }
 
+/// Context window (tokens) for a model id. `TRIAGENT_CONTEXT_TOKENS` overrides
+/// it for models the built-in table does not know.
+fn context_window(model: &str) -> usize {
+    if let Ok(v) = std::env::var("TRIAGENT_CONTEXT_TOKENS") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n >= 1000 {
+                return n;
+            }
+        }
+    }
+    let m = model.to_ascii_lowercase();
+    if m.contains("gemini") {
+        1_000_000
+    } else if m.contains("gpt-5") || m.contains("codex") {
+        400_000
+    } else if m.contains("claude") {
+        200_000
+    } else if m.contains("gpt-4") {
+        128_000
+    } else {
+        200_000
+    }
+}
+
+fn msg_chars(m: &Message) -> usize {
+    m.parts
+        .iter()
+        .map(|p| match p {
+            ContentPart::Text { text } => text.chars().count() + 8,
+            ContentPart::ToolUse { name, input, .. } => {
+                name.chars().count() + input.to_string().chars().count() + 16
+            }
+            ContentPart::ToolResult { content, .. } => content.chars().count() + 16,
+        })
+        .sum()
+}
+
+fn chars_of(messages: &[Message]) -> usize {
+    messages.iter().map(msg_chars).sum()
+}
+
+/// Flatten messages to plain text for summarization.
+fn msg_to_text(m: &Message) -> String {
+    let who = match m.role {
+        Role::User => "user",
+        Role::Assistant => "assistant",
+    };
+    let mut out = String::new();
+    for p in &m.parts {
+        match p {
+            ContentPart::Text { text } => {
+                out.push_str(who);
+                out.push_str(": ");
+                out.push_str(text);
+                out.push('\n');
+            }
+            ContentPart::ToolUse { name, input, .. } => {
+                out.push_str(&format!("[tool {name}] {input}\n"));
+            }
+            ContentPart::ToolResult { content, .. } => {
+                out.push_str(&format!("[result] {}\n", shorten(content, 2000)));
+            }
+        }
+    }
+    out
+}
+
+/// Split the transcript into chunks of at most `budget` chars.
+fn chunk_messages(messages: &[Message], budget: usize) -> Vec<String> {
+    let mut chunks = Vec::new();
+    let mut cur = String::new();
+    for m in messages {
+        let text = msg_to_text(m);
+        if !cur.is_empty() && cur.chars().count() + text.chars().count() > budget {
+            chunks.push(std::mem::take(&mut cur));
+        }
+        if text.chars().count() > budget {
+            // A single huge message: keep head and tail so both framing survive.
+            let head: String = text.chars().take(budget / 2).collect();
+            let tail: String = {
+                let total = text.chars().count();
+                text.chars()
+                    .skip(total.saturating_sub(budget / 2))
+                    .collect()
+            };
+            cur.push_str(&head);
+            cur.push_str("\n…[truncated]…\n");
+            cur.push_str(&tail);
+        } else {
+            cur.push_str(&text);
+        }
+    }
+    if !cur.is_empty() {
+        chunks.push(cur);
+    }
+    chunks
+}
+
+/// True when a provider error means "the request does not fit".
+fn is_context_overflow(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    [
+        "context_length_exceeded",
+        "context window",
+        "context length",
+        "too many tokens",
+        "maximum context",
+        "input is too long",
+        "prompt is too long",
+        "request too large",
+        "exceeds the maximum",
+        "token limit",
+        "reduce the length",
+        "string too long",
+    ]
+    .iter()
+    .any(|k| e.contains(k))
+}
+
 fn build_system(cwd: &Path, memory: &str) -> String {
-    let mut sys = format!(
-        "You are triagent, a terminal coding agent.\n\
-         You run in the directory: {cwd}\n\
-         You can explore and edit files and run shell commands with the provided tools.\n\
-         Guidelines:\n\
-         - Prefer small, verifiable steps; run builds/tests when it helps.\n\
-         - Write complete files rather than fragments.\n\
-         - Use bash only for real commands, not for viewing files (use read_file/grep/glob).\n\
-         - Keep prose concise; put details in tool calls.\n",
-        cwd = cwd.display()
-    );
+    let body = r#"You are triagent, a terminal coding agent running on the user's machine.
+Working directory: {cwd}
+You can explore and edit files and run shell commands with the provided tools.
+
+How to work:
+- Prefer small, verifiable steps; run builds and tests when they help.
+- Write complete files rather than fragments.
+- Use bash for real commands, not for viewing files (use read_file, grep, glob).
+- Never claim you ran, read or changed something you did not. If unsure, say so or check.
+- When you make a mistake, fix it and keep going; no grovelling.
+
+Response style:
+- Write in prose. Use headings, bold or bullet lists only when the content is genuinely
+  multi-part or the user asks; a short answer is a few sentences, not a template.
+- Skip preambles and don't restate the request back.
+- Ask at most one clarifying question, and only when it blocks progress; otherwise make the
+  best assumption and state it in a clause.
+- Be direct and honest: report failures plainly, state uncertainty instead of guessing, and
+  push back with a reason rather than agreeing when something is wrong.
+- Match the language the user writes in.
+
+Safety:
+- Do not help build weapons, malware, or content that sexualises minors; explain briefly and
+  offer a safe alternative.
+- For financial or legal questions give the facts and trade-offs rather than confident
+  personal recommendations, and note that you are not a lawyer or financial advisor.
+- For health topics give accurate information but do not diagnose; suggest a professional
+  when it matters.
+"#;
+    let mut sys = body.replace("{cwd}", &cwd.display().to_string());
     if !memory.is_empty() {
-        sys.push_str(&format!("\nMemory:\n{memory}\n"));
+        sys.push_str(&format!(
+            "\nMemory (notes from earlier sessions):\n{memory}\n"
+        ));
     }
     sys
 }
@@ -1731,4 +2028,89 @@ fn persist_theme(name: &str) {
 
 fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    fn msg(role: Role, text: &str) -> Message {
+        Message {
+            role,
+            parts: vec![ContentPart::Text { text: text.into() }],
+        }
+    }
+
+    #[test]
+    fn context_window_known_models() {
+        std::env::remove_var("TRIAGENT_CONTEXT_TOKENS");
+        assert_eq!(context_window("gemini-3.8-flash-high"), 1_000_000);
+        assert_eq!(context_window("claude-opus-4-6"), 200_000);
+        assert_eq!(context_window("gpt-5-codex"), 400_000);
+        assert_eq!(context_window("something-unknown"), 200_000);
+    }
+
+    #[test]
+    fn detects_context_overflow_errors() {
+        assert!(is_context_overflow(
+            "API error 400: context_length_exceeded: your prompt is too long"
+        ));
+        assert!(is_context_overflow("Input is too long for this model"));
+        assert!(is_context_overflow("request too large for model"));
+        assert!(!is_context_overflow("401 unauthorized"));
+        assert!(!is_context_overflow("rate limit exceeded"));
+    }
+
+    #[test]
+    fn chunking_splits_on_budget() {
+        let msgs: Vec<Message> = (0..10)
+            .map(|i| msg(Role::User, &"x".repeat(1000 + i)))
+            .collect();
+        let chunks = chunk_messages(&msgs, 3000);
+        assert!(
+            chunks.len() >= 3,
+            "expected several chunks, got {}",
+            chunks.len()
+        );
+        for c in &chunks {
+            assert!(
+                c.chars().count() <= 4200,
+                "chunk too big: {}",
+                c.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn chunking_truncates_single_huge_message() {
+        let huge = msg(Role::User, &"a".repeat(50_000));
+        let chunks = chunk_messages(&[huge], 10_000);
+        assert_eq!(chunks.len(), 1);
+        assert!(chunks[0].chars().count() <= 11_000);
+        assert!(chunks[0].contains("[truncated]"));
+    }
+
+    #[test]
+    fn chars_of_counts_tool_parts() {
+        let m = Message {
+            role: Role::User,
+            parts: vec![
+                ContentPart::Text {
+                    text: "hello".into(),
+                },
+                ContentPart::ToolResult {
+                    tool_use_id: "a".into(),
+                    content: "0123456789".into(),
+                    is_error: false,
+                },
+            ],
+        };
+        assert!(chars_of(&[m]) >= 15);
+    }
+
+    #[test]
+    fn flatten_renders_roles() {
+        let out = msg_to_text(&msg(Role::Assistant, "hi there"));
+        assert!(out.starts_with("assistant: hi there"));
+    }
 }
